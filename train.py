@@ -1,5 +1,9 @@
+import os
 import torch
 import torch.nn as nn
+import torch.distributed as dist
+from torch.nn.parallel import DistributedDataParallel as DDP
+from torch.utils.data.distributed import DistributedSampler
 from transformers import T5ForConditionalGeneration, T5Tokenizer
 from torch.utils.data import Dataset, DataLoader
 from typing import List, Dict, Any
@@ -61,12 +65,14 @@ class GRPO:
         model: T5ForConditionalGeneration,
         reward_model: nn.Module,
         tokenizer: T5Tokenizer,
+        device: torch.device,
         learning_rate: float = 1e-5,
         eps_clip: float = 0.2
     ):
         self.model = model
         self.reward_model = reward_model
         self.tokenizer = tokenizer
+        self.device = device
         self.optimizer = torch.optim.Adam(model.parameters(), lr=learning_rate)
         self.eps_clip = eps_clip
 
@@ -122,41 +128,77 @@ class GRPO:
             "reward": rewards.mean().item()
         }
 
+def setup_distributed():
+    # 初始化分布式环境
+    if 'RANK' in os.environ and 'WORLD_SIZE' in os.environ:
+        rank = int(os.environ['RANK'])
+        world_size = int(os.environ['WORLD_SIZE'])
+    else:
+        rank = 0
+        world_size = 1
+    
+    if torch.cuda.is_available():
+        device = torch.device(f'cuda:{rank}')
+        torch.cuda.set_device(device)
+    else:
+        device = torch.device('cpu')
+    
+    if world_size > 1:
+        dist.init_process_group('nccl' if torch.cuda.is_available() else 'gloo',
+                               rank=rank, world_size=world_size)
+    
+    return device, rank, world_size
+
 def main():
+    # 设置分布式环境
+    device, rank, world_size = setup_distributed()
+    
     # 初始化模型和tokenizer
     model_name = "t5-base"  # 或其他T5模型变体
     tokenizer = T5Tokenizer.from_pretrained(model_name)
-    model = T5ForConditionalGeneration.from_pretrained(model_name)
+    model = T5ForConditionalGeneration.from_pretrained(model_name).to(device)
+    
+    if world_size > 1:
+        model = DDP(model, device_ids=[rank])
     
     # 加载奖励模型（需要根据实际情况修改）
-    reward_model = torch.load('path_to_reward_model.pt')
+    reward_model = torch.load('path_to_reward_model.pt', map_location=device)
+    if world_size > 1:
+        reward_model = DDP(reward_model, device_ids=[rank])
     
-    # 初始化数据集
+    # 初始化数据集和分布式采样器
     train_dataset = HoverDataset(
         data_path='path_to_hover_dataset.json',
         tokenizer=tokenizer
     )
+    sampler = DistributedSampler(train_dataset) if world_size > 1 else None
     train_dataloader = DataLoader(
         train_dataset,
         batch_size=1,  # GRPO通常使用小批量
-        shuffle=True
+        shuffle=(sampler is None),
+        sampler=sampler,
+        num_workers=4
     )
     
     # 初始化训练器
     trainer = GRPO(
         model=model,
         reward_model=reward_model,
-        tokenizer=tokenizer
+        tokenizer=tokenizer,
+        device=device
     )
     
     # 训练循环
     num_epochs = 10
     for epoch in range(num_epochs):
+        if world_size > 1:
+            sampler.set_epoch(epoch)
+        
         total_loss = 0
         total_reward = 0
         for batch in train_dataloader:
             # 移动数据到设备
-            batch = {k: v.to(model.device) if isinstance(v, torch.Tensor) else v
+            batch = {k: v.to(device) if isinstance(v, torch.Tensor) else v
                     for k, v in batch.items()}
             
             # 训练步骤
@@ -164,14 +206,27 @@ def main():
             total_loss += metrics['loss']
             total_reward += metrics['reward']
         
-        # 打印训练信息
-        avg_loss = total_loss / len(train_dataloader)
-        avg_reward = total_reward / len(train_dataloader)
-        print(f'Epoch {epoch+1}/{num_epochs} - Loss: {avg_loss:.4f} - Reward: {avg_reward:.4f}')
+        if world_size > 1:
+            # 在多GPU环境下同步损失和奖励
+            dist.all_reduce(torch.tensor([total_loss, total_reward]).to(device))
+            total_loss /= world_size
+            total_reward /= world_size
         
-        # 保存模型
-        if (epoch + 1) % 5 == 0:
-            model.save_pretrained(f'model_checkpoint_epoch_{epoch+1}')
+        # 只在主进程中打印信息和保存模型
+        if rank == 0:
+            avg_loss = total_loss / len(train_dataloader)
+            avg_reward = total_reward / len(train_dataloader)
+            print(f'Epoch {epoch+1}/{num_epochs} - Loss: {avg_loss:.4f} - Reward: {avg_reward:.4f}')
+            
+            # 保存模型
+            if (epoch + 1) % 5 == 0:
+                if isinstance(model, DDP):
+                    model.module.save_pretrained(f'model_checkpoint_epoch_{epoch+1}')
+                else:
+                    model.save_pretrained(f'model_checkpoint_epoch_{epoch+1}')
+        
+        if world_size > 1:
+            dist.barrier()  # 确保所有进程同步
 
 if __name__ == "__main__":
     main()
