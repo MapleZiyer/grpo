@@ -70,15 +70,35 @@ class GRPO:
         device: torch.device,
         learning_rate: float = 1e-5,
         eps_clip: float = 0.2,
-        similarity_model = SentenceTransformer('paraphrase-MiniLM-L6-v2')
+        similarity_model = SentenceTransformer('paraphrase-MiniLM-L6-v2'),
+        gradient_accumulation_steps: int = 4,
+        warmup_steps: int = 1000,
+        max_grad_norm: float = 1.0,
+        temperature: float = 1.0,
+        top_p: float = 0.9
     ):
         self.model = model
         self.reward_model = reward_model
         self.tokenizer = tokenizer
         self.device = device
-        self.optimizer = torch.optim.Adam(model.parameters(), lr=learning_rate)
         self.eps_clip = eps_clip
         self.similarity_model = similarity_model
+        self.gradient_accumulation_steps = gradient_accumulation_steps
+        self.warmup_steps = warmup_steps
+        self.max_grad_norm = max_grad_norm
+        self.temperature = temperature
+        self.top_p = top_p
+        self.global_step = 0
+        
+        # 使用AdaFactor优化器
+        from transformers import Adafactor
+        self.optimizer = Adafactor(
+            model.parameters(),
+            lr=learning_rate,
+            scale_parameter=True,
+            relative_step=True,
+            warmup_init=True
+        )
 
     def compute_rewards(self, generated_outputs: List[str], reference_outputs: List[str]) -> torch.Tensor:
         # 使用奖励模型计算奖励值
@@ -87,6 +107,9 @@ class GRPO:
         return rewards
 
     def train_step(self, batch: Dict[str, Any]) -> Dict[str, float]:
+        # 动态调整temperature
+        self.temperature = max(0.1, self.temperature * 0.995)
+        
         # 生成序列
         with torch.no_grad():
             outputs = self.model.generate(
@@ -95,7 +118,9 @@ class GRPO:
                 max_length=self.max_length,
                 num_return_sequences=1,
                 return_dict_in_generate=True,
-                output_scores=True
+                output_scores=True,
+                temperature=self.temperature,
+                top_p=self.top_p
             )
         
         # 解码生成的序列
@@ -132,13 +157,20 @@ class GRPO:
         surr2 = torch.clamp(ratio, 1 - self.eps_clip, 1 + self.eps_clip) * rewards
         loss = -torch.min(surr1, surr2).mean()
         
-        # 优化器步骤
-        self.optimizer.zero_grad()
+        # 梯度累积
+        loss = loss / self.gradient_accumulation_steps
         loss.backward()
-        self.optimizer.step()
+        
+        # 更新步骤
+        self.global_step += 1
+        if self.global_step % self.gradient_accumulation_steps == 0:
+            # 梯度裁剪
+            torch.nn.utils.clip_grad_norm_(self.model.parameters(), self.max_grad_norm)
+            self.optimizer.step()
+            self.optimizer.zero_grad()
         
         return {
-            "loss": loss.item(),
+            "loss": loss.item() * self.gradient_accumulation_steps,
             "reward": rewards.mean().item()
         }
 
@@ -168,7 +200,7 @@ def main():
     device, rank, world_size = setup_distributed()
     
     # 初始化模型和tokenizer
-    model_name = "t5-base"  # 或其他T5模型变体
+    model_name = "google/flan-t5-base"  # 或其他T5模型变体
     tokenizer = T5Tokenizer.from_pretrained(model_name)
     model = T5ForConditionalGeneration.from_pretrained(model_name).to(device)
     
