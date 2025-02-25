@@ -8,6 +8,8 @@ from transformers import T5ForConditionalGeneration, T5Tokenizer
 from torch.utils.data import Dataset, DataLoader
 from typing import List, Dict, Any
 import numpy as np
+from sentence_transformers import SentenceTransformer
+from sklearn.metrics.pairwise import cosine_similarity
 
 class HoverDataset(Dataset):
     def __init__(self, data_path: str, tokenizer: T5Tokenizer, max_length: int = 512):
@@ -67,7 +69,8 @@ class GRPO:
         tokenizer: T5Tokenizer,
         device: torch.device,
         learning_rate: float = 1e-5,
-        eps_clip: float = 0.2
+        eps_clip: float = 0.2,
+        similarity_model = SentenceTransformer('paraphrase-MiniLM-L6-v2')
     ):
         self.model = model
         self.reward_model = reward_model
@@ -75,6 +78,7 @@ class GRPO:
         self.device = device
         self.optimizer = torch.optim.Adam(model.parameters(), lr=learning_rate)
         self.eps_clip = eps_clip
+        self.similarity_model = similarity_model
 
     def compute_rewards(self, generated_outputs: List[str], reference_outputs: List[str]) -> torch.Tensor:
         # 使用奖励模型计算奖励值
@@ -98,8 +102,18 @@ class GRPO:
         generated_texts = self.tokenizer.batch_decode(outputs.sequences, skip_special_tokens=True)
         reference_texts = [batch['raw_target']]
         
-        # 计算奖励
-        rewards = self.compute_rewards(generated_texts, reference_texts)
+        original_embedding = self.similarity_model.encode([reference_texts])
+        corrected_embedding = self.similarity_model.encode([generated_texts])
+
+        # 计算余弦相似度
+        similarity = cosine_similarity(original_embedding, corrected_embedding)
+        similarity = similarity[0][0]
+
+        if similarity < 0.7:
+            rewards = 0.0
+        else:
+            # 计算奖励
+            rewards = self.compute_rewards(generated_texts, reference_texts)
         
         # 计算策略梯度
         old_log_probs = outputs.scores[0].log_softmax(dim=-1)
